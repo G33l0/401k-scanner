@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-401k Scanner – Hardened for Sandbox Testing
+401k Scanner – Red‑Team Hardened
 Author: Red Team
-WARNING: For authorised use only. Change BASE_URL to your mock.
+Version: 2.1
+WARNING: Change BASE_URL below to your authorised sandbox target.
 """
 import sys
 import csv
@@ -12,7 +13,6 @@ import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
-from collections import defaultdict
 
 try:
     import requests
@@ -25,20 +25,11 @@ except ImportError:
     print("Missing 'beautifulsoup4'. Run: pip install beautifulsoup4")
     sys.exit(1)
 
-# ---------- CONFIGURATION (EDIT THESE) ----------
+# ---------- !!! EDIT THIS ONLY !!! ----------
 BASE_URL = "https://www.pbgc.gov/workers-retirees/find-unclaimed-retirement-benefits/search-unclaimed"
-LAST_NAME_FIELD = "last_name"
-SSN_FIELD = "ssn"
-SUCCESS_INDICATORS = ["benefit", "pension", "unclaimed", "retirement"]
-REQUEST_TIMEOUT = 15
-MAX_RETRIES = 3
-THREADS = 5                # adjust based on target rate limits
-DELAY_MIN = 1.0
-DELAY_MAX = 3.0
-OUTPUT_CSV = "results.csv"
-# ------------------------------------------------
+# -------------------------------------------
 
-# Colours (ANSI)
+# ANSI colours
 RESET = "\033[0m"
 BOLD = "\033[1m"
 RED = "\033[91m"
@@ -48,18 +39,12 @@ CYAN = "\033[96m"
 GREY = "\033[90m"
 
 def print_banner():
-    try:
-        from pyfiglet import Figlet
-        f = Figlet(font='slant', width=80)
-        print(f"{CYAN}{f.renderText('401k Scanner')}{RESET}")
-    except:
-        print(f"{CYAN}{'='*60}{RESET}")
-        print(f"{CYAN}         401k SCANNER  -  Mock Pension Retrieval{RESET}")
-        print(f"{CYAN}{'='*60}{RESET}")
-    print(f"{YELLOW}╔{'═'*58}╗{RESET}")
-    print(f"{YELLOW}║{RESET}  {BOLD}🔒 SANDBOX ONLY – Change BASE_URL in script{RESET}  {YELLOW}║{RESET}")
-    print(f"{YELLOW}║{RESET}  {GREY}Target: {BASE_URL}{RESET}  {YELLOW}║{RESET}")
-    print(f"{YELLOW}╚{'═'*58}╝{RESET}\n")
+    width = 60
+    print(f"{CYAN}{'=' * width}{RESET}")
+    print(f"{CYAN}  401k SCANNER  v2.1{RESET}".center(width))
+    print(f"{GREY}  Author: Red Team{RESET}".center(width))
+    print(f"{GREY}  Target: {BASE_URL}{RESET}".center(width))
+    print(f"{CYAN}{'=' * width}{RESET}\n")
 
 def colored_input(prompt):
     return input(f"{CYAN}{prompt}{RESET}").strip()
@@ -67,11 +52,32 @@ def colored_input(prompt):
 def print_status(msg, colour=GREEN):
     print(f"{colour}{msg}{RESET}")
 
-# ---------- Core Agent (thread‑safe) ----------
+# ---------- Configuration UI ----------
+def configure():
+    print_status("\n--- Configuration (press Enter to accept default) ---", CYAN)
+    config = {}
+
+    config['threads'] = int(colored_input(f"Max threads (default 5): ") or "5")
+    config['delay_min'] = float(colored_input(f"Min delay (seconds, default 1.0): ") or "1.0")
+    config['delay_max'] = float(colored_input(f"Max delay (seconds, default 3.0): ") or "3.0")
+    config['timeout'] = int(colored_input(f"Request timeout (seconds, default 15): ") or "15")
+    config['retries'] = int(colored_input(f"Max retries per submission (default 3): ") or "3")
+    indicators = colored_input("Success keywords (comma-separated, default: benefit,pension,unclaimed,retirement): ") or "benefit,pension,unclaimed,retirement"
+    config['success_indicators'] = [kw.strip() for kw in indicators.split(',') if kw.strip()]
+    config['output_csv'] = colored_input(f"Output CSV filename (default: results.csv): ") or "results.csv"
+
+    print_status("\nConfiguration saved.", GREEN)
+    return config
+
+# ---------- Core Agent ----------
 class PBGCAgent:
-    def __init__(self, base_url, timeout=REQUEST_TIMEOUT):
+    def __init__(self, base_url, config):
         self.base_url = base_url.rstrip('/')
-        self.timeout = timeout
+        self.timeout = config['timeout']
+        self.max_retries = config['retries']
+        self.delay_min = config['delay_min']
+        self.delay_max = config['delay_max']
+        self.success_indicators = config['success_indicators']
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -81,10 +87,9 @@ class PBGCAgent:
         self._cached_search_html = None
 
     def _delay(self):
-        time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+        time.sleep(random.uniform(self.delay_min, self.delay_max))
 
     def _fetch_search_page(self):
-        """Fetch and cache the search page HTML and form tokens."""
         if self._cached_search_html is not None:
             return self._cached_search_html
         try:
@@ -99,18 +104,14 @@ class PBGCAgent:
             return None
 
     def _extract_tokens(self, html):
-        """Extract Drupal form tokens and any other hidden inputs."""
         soup = BeautifulSoup(html, 'html.parser')
         tokens = {}
-        # Look for the form – if multiple, prefer one with our fields
         for form in soup.find_all('form'):
-            inputs = form.find_all('input')
-            for inp in inputs:
+            for inp in form.find_all('input'):
                 name = inp.get('name')
                 value = inp.get('value', '')
                 if name in ('form_build_id', 'form_id', 'op', 'form_token'):
                     tokens[name] = value
-                # Also collect any hidden input that might be needed
                 if inp.get('type') == 'hidden' and name:
                     tokens[name] = value
         if 'op' not in tokens:
@@ -118,16 +119,13 @@ class PBGCAgent:
         return tokens
 
     def _submit_search(self, last_name, ssn, tokens):
-        """POST with last_name, ssn, and tokens."""
-        url = self.base_url
         data = {
-            LAST_NAME_FIELD: last_name,
-            SSN_FIELD: ssn,
+            'last_name': last_name,
+            'ssn': ssn,
         }
         data.update(tokens)
-
         try:
-            resp = self.session.post(url, data=data, timeout=self.timeout)
+            resp = self.session.post(self.base_url, data=data, timeout=self.timeout)
             resp.raise_for_status()
             self._delay()
             return resp.text
@@ -136,20 +134,17 @@ class PBGCAgent:
             return None
 
     def _parse_result(self, html):
-        """Improved parsing with multiple fallbacks."""
         if not html:
             return False, "Unknown", "Unknown"
 
         soup = BeautifulSoup(html, 'html.parser')
         text = soup.get_text(separator=' ')
 
-        # 1. Benefit found?
         lower = text.lower()
-        benefit = any(ind in lower for ind in SUCCESS_INDICATORS)
+        benefit = any(ind in lower for ind in self.success_indicators)
 
-        # 2. Institution – try several strategies
+        # Institution
         inst = "Unknown"
-        # Strategy A: regex patterns
         inst_patterns = [
             r'(?:Plan|Institution|Provider|Company)\s*:\s*([^\n\r<]+)',
             r'(?:Retirement Plan|Pension Plan)\s*:\s*([^\n\r<]+)',
@@ -160,14 +155,12 @@ class PBGCAgent:
             if m:
                 inst = m.group(1).strip()
                 break
-        # Strategy B: look for bold/strong elements containing keywords
         if inst == "Unknown":
             for tag in soup.find_all(['strong', 'b', 'h2', 'h3']):
                 txt = tag.get_text(strip=True)
                 if re.search(r'(plan|institution|provider|company)', txt, re.I):
                     parent = tag.find_parent()
                     if parent:
-                        # Try sibling text or next element
                         sibling = parent.find_next_sibling()
                         if sibling:
                             inst = sibling.get_text(strip=True).split('.')[0]
@@ -176,7 +169,7 @@ class PBGCAgent:
                         if inst:
                             break
 
-        # 3. Status
+        # Status
         status = "Unknown"
         status_patterns = [
             r'(?:Status|Account Status)\s*:\s*([A-Za-z]+)',
@@ -193,46 +186,36 @@ class PBGCAgent:
                     status = word
                     break
 
-        # Bonus: if the response says "no records" or "not found", benefit should be False
         if re.search(r'no (results?|records?|benefits?|pensions?)', lower):
             benefit = False
 
         return benefit, inst, status
 
     def process(self, person):
-        """Process one individual, returning enriched dict."""
-        # Extract last name
         name_parts = person['full_name'].strip().split()
         last_name = name_parts[-1] if name_parts else 'Unknown'
         ssn = person.get('ssn', '')
 
-        # 1. Get search page (cached)
         html = self._fetch_search_page()
         if not html:
             return {**person, 'benefit_found': 'ERROR', 'institution': 'N/A',
                     'account_status': 'N/A', 'status': 'Fetch failed'}
 
-        tokens = self._cached_tokens.copy()  # copy to avoid mutation
-
-        # 2. Submit with retries
+        tokens = self._cached_tokens.copy()
         result_html = None
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(self.max_retries):
             result_html = self._submit_search(last_name, ssn, tokens)
             if result_html:
-                # Check for common validation errors
                 lower_resp = result_html.lower()
                 if 'please enter a valid' in lower_resp or 'invalid' in lower_resp:
-                    # Refresh tokens (maybe session expired)
-                    logging.debug(f"Invalid input, refreshing tokens (attempt {attempt+1})")
                     self._cached_search_html = None
                     self._cached_tokens = None
                     fresh = self._fetch_search_page()
                     if fresh:
                         tokens = self._cached_tokens.copy()
                     continue
-                # If we got a proper response, break
                 break
-            time.sleep(1 * (attempt + 1))  # backoff
+            time.sleep(1 * (attempt + 1))
 
         if not result_html:
             return {**person, 'benefit_found': 'ERROR', 'institution': 'N/A',
@@ -247,53 +230,82 @@ class PBGCAgent:
             'status': 'Success'
         }
 
-# ---------- CSV & I/O ----------
-def detect_columns(reader):
-    """Map input columns to our required fields."""
-    fieldnames = reader.fieldnames
-    mapping = {}
-    for col in fieldnames:
-        low = col.strip().lower()
-        if low in ('full_name', 'name', 'fullname'):
-            mapping['full_name'] = col
-        elif low in ('ssn', 'social', 'social_security', 'ssn_number'):
-            mapping['ssn'] = col
-        elif low in ('dob', 'birthdate', 'date_of_birth'):
-            mapping['dob'] = col
-        elif low in ('address', 'addr', 'street'):
-            mapping['address'] = col
-    # Ensure we have at least full_name and ssn
-    if 'full_name' not in mapping or 'ssn' not in mapping:
+# ---------- Input Parsing (TXT) ----------
+def parse_txt_line(line, delimiter, field_order):
+    """
+    field_order: string like "name,ssn" or "ssn,name" or "name,ssn,dob,address"
+    Returns dict with keys: full_name, ssn, dob, address (missing fields = '')
+    """
+    parts = [p.strip() for p in line.split(delimiter)]
+    if len(parts) < 2:
         return None
-    return mapping
+    mapping = {}
+    order = [f.strip() for f in field_order.split(',') if f.strip()]
+    for idx, field in enumerate(order):
+        if idx < len(parts):
+            mapping[field] = parts[idx]
+    # Ensure required fields exist
+    if 'name' not in mapping or 'ssn' not in mapping:
+        return None
+    return {
+        'full_name': mapping.get('name', ''),
+        'ssn': mapping.get('ssn', ''),
+        'dob': mapping.get('dob', ''),
+        'address': mapping.get('address', '')
+    }
 
-def load_people(input_file):
+def load_people_from_txt(filepath, delimiter, field_order):
     people = []
     try:
-        with open(input_file, 'r', newline='', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            mapping = detect_columns(reader)
-            if not mapping:
-                print_status("[!] Input CSV must contain 'full_name' (or name) and 'ssn' columns.", RED)
-                return None
-            for row in reader:
-                person = {
-                    'full_name': row.get(mapping['full_name'], '').strip(),
-                    'ssn': row.get(mapping['ssn'], '').strip(),
-                    'dob': row.get(mapping.get('dob', ''), '').strip(),
-                    'address': row.get(mapping.get('address', ''), '').strip()
-                }
-                if person['full_name'] and person['ssn']:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                person = parse_txt_line(line, delimiter, field_order)
+                if person:
                     people.append(person)
                 else:
-                    logging.warning(f"Skipping row missing name or SSN: {row}")
+                    logging.warning(f"Line {line_no}: invalid format, skipped: {line}")
         return people
     except Exception as e:
         print_status(f"[!] Load error: {e}", RED)
         return None
 
+def get_single_person():
+    name = colored_input("Full Name: ")
+    ssn = colored_input("SSN (e.g., 123-45-6789): ")
+    if not name or not ssn:
+        return None
+    return [{'full_name': name, 'ssn': ssn, 'dob': '', 'address': ''}]
+
+def get_batch_people():
+    filepath = colored_input("Path to TXT file: ")
+    if not filepath:
+        return None
+    delimiter_choice = colored_input("Delimiter (comma, tab, space, or custom char): ").lower()
+    if delimiter_choice == 'comma':
+        delimiter = ','
+    elif delimiter_choice == 'tab':
+        delimiter = '\t'
+    elif delimiter_choice == 'space':
+        delimiter = ' '
+    else:
+        delimiter = delimiter_choice  # custom
+    field_order = colored_input("Field order (comma-separated, e.g., name,ssn or ssn,name or name,ssn,dob,address): ")
+    if not field_order:
+        print_status("Field order required.", RED)
+        return None
+    # Validate that name and ssn are in the order
+    fields = [f.strip() for f in field_order.split(',')]
+    if 'name' not in fields or 'ssn' not in fields:
+        print_status("Field order must include 'name' and 'ssn'.", RED)
+        return None
+    people = load_people_from_txt(filepath, delimiter, field_order)
+    return people
+
+# ---------- Output Writing ----------
 def write_results(output_file, results, append=False):
-    """Write results incrementally; if append, we don't rewrite header."""
     fieldnames = ['full_name', 'ssn', 'dob', 'address', 'benefit_found', 'institution', 'account_status', 'status']
     mode = 'a' if append else 'w'
     try:
@@ -308,61 +320,45 @@ def write_results(output_file, results, append=False):
         logging.error(f"Write error: {e}")
         return False
 
-def generate_sample(output_file):
-    sample = [
-        {'full_name': 'John Doe', 'ssn': '123-45-6789', 'dob': '1980-01-15', 'address': '123 Main St'},
-        {'full_name': 'Jane Smith', 'ssn': '987-65-4321', 'dob': '1975-12-10', 'address': '456 Oak Ave'},
-    ]
-    try:
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['full_name', 'ssn', 'dob', 'address'])
-            writer.writeheader()
-            writer.writerows(sample)
-        print_status(f"[+] Sample CSV generated: {output_file}", GREEN)
-        return True
-    except Exception as e:
-        print_status(f"[!] Sample error: {e}", RED)
-        return False
-
 # ---------- Main ----------
 def main():
     print_banner()
-    print("Choose CSV option:")
-    print("  [1] Use existing CSV")
-    print("  [2] Generate sample CSV")
-    choice = colored_input("Enter 1 or 2: ")
-    if choice == '1':
-        input_file = colored_input("Path to input CSV: ")
-        if not input_file:
+
+    # Configuration (all adjustable)
+    config = configure()
+
+    # Scan mode
+    print_status("\n--- Scan Mode ---", CYAN)
+    mode = colored_input("Choose mode: [1] Single scan  [2] Batch scan from TXT: ")
+    if mode == '1':
+        people = get_single_person()
+        if not people:
             print_status("Aborted.", RED)
             return
-        output_file = colored_input(f"Output CSV (default: {OUTPUT_CSV}): ") or OUTPUT_CSV
-    elif choice == '2':
-        input_file = colored_input("Sample filename (default: people.csv): ") or "people.csv"
-        if not generate_sample(input_file):
+    elif mode == '2':
+        people = get_batch_people()
+        if not people:
+            print_status("Aborted.", RED)
             return
-        output_file = colored_input(f"Output CSV (default: {OUTPUT_CSV}): ") or OUTPUT_CSV
     else:
         print_status("Invalid choice.", RED)
         return
 
-    people = load_people(input_file)
-    if not people:
-        print_status("[!] No valid records.", RED)
-        return
+    print_status(f"[*] Loaded {len(people)} individual(s).", GREEN)
 
-    print_status(f"[*] Loaded {len(people)} individuals. Using {THREADS} threads.", GREEN)
-
-    # Prepare output file (overwrite with header)
+    # Prepare output file (overwrite)
+    output_file = config['output_csv']
     write_results(output_file, [], append=False)
 
-    agent = PBGCAgent(BASE_URL)
+    agent = PBGCAgent(BASE_URL, config)
     results = []
     total = len(people)
     completed = 0
 
-    # Use ThreadPoolExecutor for concurrency
-    with ThreadPoolExecutor(max_workers=THREADS) as executor:
+    # For single scan, just process sequentially (threads=1)
+    max_workers = 1 if total == 1 else config['threads']
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_person = {executor.submit(agent.process, p): p for p in people}
         for future in as_completed(future_to_person):
             person = future_to_person[future]
@@ -370,21 +366,18 @@ def main():
                 result = future.result()
                 results.append(result)
                 completed += 1
-                # Print real‑time summary
                 status_colour = GREEN if result['benefit_found'] == 'TRUE' else YELLOW
                 print(f"[{completed}/{total}] {result['full_name']:<20} "
                       f"Benefit: {result['benefit_found']:<5} "
                       f"Inst: {result['institution']:<15} "
                       f"Status: {result['account_status']:<10} "
                       f"({result['status']})", status_colour)
-                # Write incrementally every 5 results to avoid losing progress
                 if len(results) % 5 == 0:
                     write_results(output_file, results[-5:], append=True)
             except Exception as e:
                 logging.error(f"Failed to process {person.get('full_name')}: {e}")
                 completed += 1
 
-    # Write any remaining results
     if results:
         write_results(output_file, results, append=True)
     print_status(f"\n[+] All done. Results saved to {output_file}", GREEN)
