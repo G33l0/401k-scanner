@@ -2,7 +2,7 @@
 """
 401k Scanner – Enterprise Red‑Team Edition
 Author: Red Team
-Version: 3.0
+Version: 3.1
 WARNING: Change BASE_URL below to your authorised sandbox target.
 """
 import sys
@@ -64,7 +64,7 @@ def print_banner():
     clear_screen()
     width = 60
     print(f"{CYAN}{'=' * width}{RESET}")
-    print(f"{CYAN}  401k SCANNER  v3.0 (Enterprise){RESET}".center(width))
+    print(f"{CYAN}  401k SCANNER  v3.1 (Enterprise){RESET}".center(width))
     print(f"{GREY}  Author: Red Team{RESET}".center(width))
     print(f"{GREY}  Target: {BASE_URL}{RESET}".center(width))
     print(f"{CYAN}{'=' * width}{RESET}\n")
@@ -79,14 +79,14 @@ def print_status(msg, colour=GREEN):
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
     "threads": 5,
-    "rate_limit": 5.0,          # requests per second (global)
+    "rate_limit": 5.0,
     "delay_min": 0.5,
     "delay_max": 1.5,
     "timeout": 15,
     "retries": 3,
     "success_indicators": ["benefit", "pension", "unclaimed", "retirement"],
     "output_base": "results",
-    "proxy": None,              # e.g., "http://user:pass@proxy:8080" or "socks5://..."
+    "proxy": None,
     "user_agents": [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -97,13 +97,23 @@ DEFAULT_CONFIG = {
         "Accept-Encoding": "gzip, deflate, br",
         "DNT": "1"
     },
-    "captcha_service": None,    # e.g., "2captcha" or "anti-captcha"
+    "captcha_service": None,
     "captcha_api_key": "",
-    "encryption_password": "",  # will be prompted if not set
+    "encryption_password": "",
     "secure_delete": False,
     "checkpoint_file": "checkpoint.txt",
     "dead_letter_file": "dead_letter.txt",
-    "audit_log_file": "audit.log"
+    "audit_log_file": "audit.log",
+    "column_widths": {  # adjustable for output alignment
+        "full_name": 25,
+        "ssn": 15,
+        "dob": 12,
+        "address": 20,
+        "benefit_found": 8,
+        "institution": 40,
+        "account_status": 15,
+        "status": 12
+    }
 }
 
 class ConfigManager:
@@ -136,8 +146,11 @@ class ConfigManager:
         config = ConfigManager.load()
         # Show current values
         for key, val in config.items():
-            if key in ("user_agents", "custom_headers", "success_indicators", "captcha_api_key", "encryption_password"):
-                print(f"  {key}: <hidden or list>")
+            if key in ("user_agents", "custom_headers", "success_indicators", "captcha_api_key", "encryption_password", "column_widths"):
+                if key == "column_widths":
+                    print(f"  column_widths: {val}")
+                else:
+                    print(f"  {key}: <hidden or list>")
             else:
                 print(f"  {key}: {val}")
 
@@ -170,10 +183,24 @@ class ConfigManager:
                 else:
                     new_config[key] = val
             elif key in ("encryption_password", "captcha_api_key"):
-                # Sensitive, we don't show current
                 inp = colored_input(f"{key} (leave blank to keep current): ")
                 if inp:
                     new_config[key] = inp
+                else:
+                    new_config[key] = val
+            elif key == "column_widths":
+                print("Current column widths:", val)
+                inp = colored_input("Adjust column widths as JSON (e.g., '{\"full_name\":30,\"ssn\":15}') or blank: ")
+                if inp:
+                    try:
+                        new_w = json.loads(inp)
+                        # merge with existing
+                        merged = val.copy()
+                        merged.update(new_w)
+                        new_config[key] = merged
+                    except:
+                        print_status("Invalid JSON, keeping current.", RED)
+                        new_config[key] = val
                 else:
                     new_config[key] = val
             else:
@@ -194,7 +221,7 @@ class ConfigManager:
             print_status("Configuration saved.", GREEN)
         return new_config
 
-# ---------- Rate Limiter (Token Bucket) ----------
+# ---------- Rate Limiter ----------
 class TokenBucket:
     def __init__(self, rate_per_sec):
         self.rate = rate_per_sec
@@ -210,8 +237,6 @@ class TokenBucket:
             if self.tokens > 1.0:
                 self.tokens = 1.0
             self.last_time = now
-            if self.tokens < 0:
-                self.tokens = 0
             if self.tokens < 1.0:
                 sleep_time = (1.0 - self.tokens) / self.rate
                 time.sleep(sleep_time)
@@ -244,7 +269,6 @@ def encrypt_file(filepath, password):
         key, salt = get_fernet_key(password)
         fernet = Fernet(key)
         encrypted = fernet.encrypt(data)
-        # Save salt and encrypted data
         with open(filepath + '.enc', 'wb') as f:
             f.write(salt + encrypted)
         os.remove(filepath)
@@ -273,7 +297,6 @@ def decrypt_file(filepath, password):
         logging.error(f"Decryption failed: {e}")
         return False
 
-# ---------- Secure Delete ----------
 def secure_delete(filepath):
     if not os.path.exists(filepath):
         return
@@ -293,7 +316,6 @@ class AuditLogger:
     def __init__(self, logfile):
         self.logfile = logfile
         self.lock = Lock()
-        # ensure directory exists
         os.makedirs(os.path.dirname(logfile) or '.', exist_ok=True)
 
     def log(self, event_type, message, **kwargs):
@@ -307,7 +329,7 @@ class AuditLogger:
             with open(self.logfile, 'a') as f:
                 f.write(json.dumps(entry) + '\n')
 
-# ---------- Core Agent (per worker) ----------
+# ---------- Core Agent ----------
 class PBGCAgent:
     def __init__(self, base_url, config, rate_limiter, audit_logger):
         self.base_url = base_url.rstrip('/')
@@ -320,13 +342,10 @@ class PBGCAgent:
         self.delay_max = config['delay_max']
         self.success_indicators = config['success_indicators']
         self.session = requests.Session()
-        # Proxy
         if config.get('proxy'):
             self.session.proxies = {'http': config['proxy'], 'https': config['proxy']}
-        # User-Agent rotation
         ua_list = config.get('user_agents', DEFAULT_CONFIG['user_agents'])
         self.session.headers['User-Agent'] = random.choice(ua_list)
-        # Custom headers
         for k, v in config.get('custom_headers', {}).items():
             self.session.headers[k] = v
         self._cached_tokens = None
@@ -337,10 +356,8 @@ class PBGCAgent:
         time.sleep(random.uniform(self.delay_min, self.delay_max))
 
     def _fetch_search_page(self):
-        # Use cached if available
         if self._cached_search_html is not None:
             return self._cached_search_html
-        # Rate limit
         self.rate_limiter.wait()
         try:
             resp = self.session.get(self.base_url, timeout=self.timeout)
@@ -376,11 +393,9 @@ class PBGCAgent:
             'ssn': ssn,
         }
         data.update(tokens)
-        # Rate limit
         self.rate_limiter.wait()
         try:
             resp = self.session.post(self.base_url, data=data, timeout=self.timeout)
-            # Adaptive backoff on 429/503
             if resp.status_code in (429, 503):
                 self.audit.log("RATE_LIMIT", f"Received {resp.status_code}, backing off", status=resp.status_code)
                 time.sleep(2 ** (self.max_retries - 1))
@@ -403,20 +418,16 @@ class PBGCAgent:
         lower = text.lower()
         benefit = any(ind in lower for ind in self.success_indicators)
 
-        # Institution - improved with CSS/XPath fallbacks
+        # Institution
         inst = "Unknown"
-        # Try XPath-like: find element containing "Plan" or "Institution" text, then grab following text
-        # Use BeautifulSoup to find any tag with text containing these keywords
         for tag in soup.find_all(['p', 'div', 'span', 'td', 'th']):
             txt = tag.get_text(strip=True)
             if re.search(r'(plan|institution|provider|company)\s*:', txt, re.I):
-                # Extract after colon
                 match = re.search(r'(?:plan|institution|provider|company)\s*:\s*(.+)', txt, re.I)
                 if match:
                     inst = match.group(1).strip()
                     break
         if inst == "Unknown":
-            # Fallback: find any bold/strong with keyword
             for tag in soup.find_all(['strong', 'b', 'h2', 'h3']):
                 txt = tag.get_text(strip=True)
                 if re.search(r'(plan|institution|provider|company)', txt, re.I):
@@ -430,7 +441,7 @@ class PBGCAgent:
                         if inst:
                             break
 
-        # Status - similar approach
+        # Status
         status = "Unknown"
         for tag in soup.find_all(['p', 'div', 'span', 'td', 'th']):
             txt = tag.get_text(strip=True)
@@ -454,9 +465,8 @@ class PBGCAgent:
         name_parts = person['full_name'].strip().split()
         last_name = name_parts[-1] if name_parts else 'Unknown'
         ssn = person.get('ssn', '')
-        person_id = f"{last_name}_{ssn}"  # unique ID for checkpoint
+        person_id = f"{last_name}_{ssn}"
 
-        # Check checkpoint: skip if already processed
         if person_id in checkpoint_set:
             return {**person, 'benefit_found': 'SKIPPED', 'institution': 'N/A',
                     'account_status': 'N/A', 'status': 'Checkpoint'}
@@ -476,7 +486,6 @@ class PBGCAgent:
             if result_html:
                 lower_resp = result_html.lower()
                 if 'please enter a valid' in lower_resp or 'invalid' in lower_resp:
-                    # Refresh tokens
                     self._cached_search_html = None
                     self._cached_tokens = None
                     fresh = self._fetch_search_page()
@@ -542,7 +551,6 @@ def parse_txt_line(line, delimiter, field_order):
 
 def load_people(filepath, delimiter, field_order, password=None):
     people = []
-    # Decrypt if needed
     if password and filepath.endswith('.enc'):
         if not decrypt_file(filepath, password):
             print_status("Decryption failed.", RED)
@@ -564,17 +572,53 @@ def load_people(filepath, delimiter, field_order, password=None):
         print_status(f"Load error: {e}", RED)
         return None
 
-# ---------- Output Writing ----------
+# ---------- Output Writing (Aligned) ----------
 def write_results(output_file, results, append=False, encrypt=False, password=None):
     fieldnames = ['full_name', 'ssn', 'dob', 'address', 'benefit_found', 'institution', 'account_status', 'status']
+    # Clean institution: replace newlines with ' | '
+    for r in results:
+        if 'institution' in r:
+            r['institution'] = r['institution'].replace('\n', ' | ').replace('\r', '')
+    
+    # Load column widths from config (or use defaults)
+    config = ConfigManager.load()
+    widths = config.get('column_widths', DEFAULT_CONFIG['column_widths'])
+    # Ensure all fields have a width
+    for f in fieldnames:
+        if f not in widths:
+            widths[f] = 15  # fallback
+
+    # If we are appending, we need to read existing file to compute max widths? For simplicity, we use fixed widths.
+    # However, we can adjust based on current data to avoid truncation.
+    all_rows = []
+    if not append:
+        # First write: include header
+        header = {f: f.replace('_', ' ').title() for f in fieldnames}
+        rows = [header] + results
+    else:
+        # When appending, we only have the new results; we still want to align with existing header.
+        # We'll just use the fixed widths.
+        rows = results
+
+    # Compute max widths from current batch
+    for field in fieldnames:
+        max_len = max((len(str(row.get(field, ''))) for row in rows), default=0)
+        widths[field] = max(widths[field], max_len + 2)
+
     mode = 'a' if append else 'w'
     try:
         with open(output_file, mode, encoding='utf-8') as f:
+            # If it's a new file or first write, write header and separator
             if not append or os.path.getsize(output_file) == 0:
-                f.write('\t'.join(fieldnames) + '\n')
+                header_line = '  '.join(f"{header[f]:<{widths[f]}}" for f in fieldnames)
+                f.write(header_line + '\n')
+                f.write('-' * len(header_line) + '\n')
+            # Now write each result
             for r in results:
-                row = [str(r.get(k, '')) for k in fieldnames]
-                f.write('\t'.join(row) + '\n')
+                row = [str(r.get(f, '')) for f in fieldnames]
+                # Truncate if longer than width? We'll format; if too long, it will overflow.
+                line = '  '.join(f"{row[i]:<{widths[f]}}" for i, f in enumerate(fieldnames))
+                f.write(line + '\n')
         if encrypt and password:
             encrypt_file(output_file, password)
         return True
@@ -584,13 +628,11 @@ def write_results(output_file, results, append=False, encrypt=False, password=No
 
 # ---------- Headless / Interactive ----------
 def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_order=None, headless=False):
-    # Load checkpoint
     load_checkpoint(config['checkpoint_file'])
     audit = AuditLogger(config['audit_log_file'])
     rate_limiter = TokenBucket(config['rate_limit'])
 
     if headless:
-        # Parse input
         if not input_file or not delimiter or not field_order:
             print_status("Headless mode requires -i, --delimiter, --field-order", RED)
             return
@@ -600,7 +642,6 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
             return
         output_base = output_prefix or config['output_base']
     else:
-        # Interactive: get input details
         print_status("\n--- Scan Mode ---", CYAN)
         mode = colored_input("Choose mode: [1] Single scan  [2] Batch scan from TXT: ")
         if mode == '1':
@@ -648,29 +689,22 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
     # Prepare output
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = f"{output_base}_{timestamp}.txt"
-    if config.get('encryption_password'):
-        encrypt_out = True
-        password = config['encryption_password']
-    else:
-        encrypt_out = False
-        password = None
+    encrypt_out = bool(config.get('encryption_password'))
+    password = config.get('encryption_password')
 
     # Clear output file
-    write_results(output_file, [], append=False, encrypt=False)  # we encrypt later
+    write_results(output_file, [], append=False, encrypt=False)
 
     total = len(people)
     completed = 0
     results = []
 
     max_workers = 1 if total == 1 else config['threads']
-
-    # Prepare dead-letter
     dead_file = config['dead_letter_file']
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_person = {}
         for p in people:
-            # Skip checkpointed
             person_id = f"{p['full_name'].split()[-1]}_{p['ssn']}"
             if person_id in checkpoint_set:
                 completed += 1
@@ -682,36 +716,27 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
             person, person_id = future_to_person[future]
             try:
                 result = future.result()
-                # Check if error
                 if result['benefit_found'] in ('ERROR', 'SKIPPED'):
-                    # Log to dead letter
                     log_dead_letter(dead_file, result, result.get('status', 'Unknown'))
                 else:
                     results.append(result)
-                    # Save checkpoint
                     save_checkpoint(config['checkpoint_file'], person_id)
                 completed += 1
 
-                # Real-time output
                 if result['benefit_found'] == 'TRUE':
                     colour = GREEN
-                    status_text = "FOUND"
                 elif result['benefit_found'] == 'FALSE':
                     colour = YELLOW
-                    status_text = "NOT FOUND"
                 elif result['benefit_found'] == 'SKIPPED':
                     colour = GREY
-                    status_text = "SKIPPED"
                 else:
                     colour = RED
-                    status_text = "ERROR"
                 print(f"[{completed}/{total}] {result['full_name']:<20} "
                       f"Benefit: {result['benefit_found']:<5} "
                       f"Inst: {result['institution']:<15} "
                       f"Status: {result['account_status']:<10} "
                       f"({result['status']})", colour)
 
-                # Write in batches of 5
                 if len(results) % 5 == 0:
                     write_results(output_file, results[-5:], append=True, encrypt=False)
 
@@ -721,15 +746,12 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
                 log_dead_letter(dead_file, person, f"Exception: {e}")
                 completed += 1
 
-    # Write remaining
     if results:
         write_results(output_file, results, append=True, encrypt=False)
 
-    # Encrypt final output if needed
     if encrypt_out and password:
         encrypt_file(output_file, password)
 
-    # Secure delete input if encrypted and secure_delete enabled
     if config.get('secure_delete') and input_file and input_file.endswith('.enc'):
         secure_delete(input_file)
 
@@ -760,7 +782,6 @@ def main():
         except Exception as e:
             print_status(f"Failed to load custom config: {e}", RED)
 
-    # If encryption password not set, prompt if not headless
     if not config.get('encryption_password') and not args.headless:
         pwd = colored_input("Encryption password (optional, press Enter to skip): ")
         if pwd:
@@ -768,7 +789,6 @@ def main():
             ConfigManager.save(config)
 
     if args.headless:
-        # Must provide input, delimiter, field-order
         if not args.input or not args.delimiter or not args.field_order:
             print_status("Headless mode requires -i, -d, -f", RED)
             sys.exit(1)
@@ -791,15 +811,10 @@ def main():
             config = ConfigManager.configure()
             input(f"{CYAN}Press Enter to continue...{RESET}")
         elif choice == '3':
-            # Secure delete if configured
             if config.get('secure_delete'):
-                # Delete sensitive config if password present
                 if config.get('encryption_password'):
-                    # Overwrite the password in memory
                     config['encryption_password'] = ''
                     ConfigManager.save(config)
-                    # Also delete any leftover .enc files? Not safe.
-                    pass
             print_status("Goodbye.", GREEN)
             break
         else:
