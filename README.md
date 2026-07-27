@@ -8,7 +8,7 @@ How to Use
 1. Edit BASE_URL (line ~22) to your sandbox endpoint.
 2. Install dependencies:
    ```bash
-   pip install requests beautifulsoup4
+   pip install requests beautifulsoup4 cryptography
    ```
 3. Run:
    ```bash
