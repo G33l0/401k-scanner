@@ -2,7 +2,7 @@
 """
 401k Scanner – Enterprise Red‑Team Edition
 Author: Red Team
-Version: 3.1
+Version: 3.2
 WARNING: Change BASE_URL below to your authorised sandbox target.
 """
 import sys
@@ -64,7 +64,7 @@ def print_banner():
     clear_screen()
     width = 60
     print(f"{CYAN}{'=' * width}{RESET}")
-    print(f"{CYAN}  401k SCANNER  v3.1 (Enterprise){RESET}".center(width))
+    print(f"{CYAN}  401k SCANNER  v3.2 (Enterprise){RESET}".center(width))
     print(f"{GREY}  Author: Red Team{RESET}".center(width))
     print(f"{GREY}  Target: {BASE_URL}{RESET}".center(width))
     print(f"{CYAN}{'=' * width}{RESET}\n")
@@ -104,7 +104,7 @@ DEFAULT_CONFIG = {
     "checkpoint_file": "checkpoint.txt",
     "dead_letter_file": "dead_letter.txt",
     "audit_log_file": "audit.log",
-    "column_widths": {  # adjustable for output alignment
+    "column_widths": {
         "full_name": 25,
         "ssn": 15,
         "dob": 12,
@@ -144,7 +144,6 @@ class ConfigManager:
     def configure():
         print_status("\n--- Current Configuration ---", CYAN)
         config = ConfigManager.load()
-        # Show current values
         for key, val in config.items():
             if key in ("user_agents", "custom_headers", "success_indicators", "captcha_api_key", "encryption_password", "column_widths"):
                 if key == "column_widths":
@@ -194,7 +193,6 @@ class ConfigManager:
                 if inp:
                     try:
                         new_w = json.loads(inp)
-                        # merge with existing
                         merged = val.copy()
                         merged.update(new_w)
                         new_config[key] = merged
@@ -572,58 +570,55 @@ def load_people(filepath, delimiter, field_order, password=None):
         print_status(f"Load error: {e}", RED)
         return None
 
-# ---------- Output Writing (Aligned) ----------
+# ---------- Output Writing (Aligned) - FIXED ----------
 def write_results(output_file, results, append=False, encrypt=False, password=None):
     fieldnames = ['full_name', 'ssn', 'dob', 'address', 'benefit_found', 'institution', 'account_status', 'status']
     # Clean institution: replace newlines with ' | '
     for r in results:
         if 'institution' in r:
             r['institution'] = r['institution'].replace('\n', ' | ').replace('\r', '')
-    
+
     # Load column widths from config (or use defaults)
     config = ConfigManager.load()
     widths = config.get('column_widths', DEFAULT_CONFIG['column_widths'])
-    # Ensure all fields have a width
     for f in fieldnames:
         if f not in widths:
-            widths[f] = 15  # fallback
+            widths[f] = 15
 
-    # If we are appending, we need to read existing file to compute max widths? For simplicity, we use fixed widths.
-    # However, we can adjust based on current data to avoid truncation.
-    all_rows = []
-    if not append:
-        # First write: include header
-        header = {f: f.replace('_', ' ').title() for f in fieldnames}
-        rows = [header] + results
-    else:
-        # When appending, we only have the new results; we still want to align with existing header.
-        # We'll just use the fixed widths.
-        rows = results
+    # Prepare header (always defined)
+    header = {f: f.replace('_', ' ').title() for f in fieldnames}
 
-    # Compute max widths from current batch
-    for field in fieldnames:
-        max_len = max((len(str(row.get(field, ''))) for row in rows), default=0)
-        widths[field] = max(widths[field], max_len + 2)
+    # Check if file exists and has content
+    file_exists = os.path.exists(output_file) and os.path.getsize(output_file) > 0
 
     mode = 'a' if append else 'w'
     try:
         with open(output_file, mode, encoding='utf-8') as f:
-            # If it's a new file or first write, write header and separator
-            if not append or os.path.getsize(output_file) == 0:
+            # Write header only if we are creating a new file or overwriting
+            if not append or not file_exists:
+                # Compute widths based on header + this batch (to auto-adjust)
+                all_rows = [header] + results
+                for field in fieldnames:
+                    max_len = max((len(str(row.get(field, ''))) for row in all_rows), default=0)
+                    widths[field] = max(widths[field], max_len + 2)
                 header_line = '  '.join(f"{header[f]:<{widths[f]}}" for f in fieldnames)
                 f.write(header_line + '\n')
                 f.write('-' * len(header_line) + '\n')
-            # Now write each result
+            # else: appending to existing file, we don't rewrite header
+
+            # Write each result
             for r in results:
                 row = [str(r.get(f, '')) for f in fieldnames]
-                # Truncate if longer than width? We'll format; if too long, it will overflow.
                 line = '  '.join(f"{row[i]:<{widths[f]}}" for i, f in enumerate(fieldnames))
                 f.write(line + '\n')
+
         if encrypt and password:
             encrypt_file(output_file, password)
         return True
     except Exception as e:
         logging.error(f"Write error: {e}")
+        # Print error so user sees it
+        print_status(f"[!] Failed to write results: {e}", RED)
         return False
 
 # ---------- Headless / Interactive ----------
@@ -692,7 +687,7 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
     encrypt_out = bool(config.get('encryption_password'))
     password = config.get('encryption_password')
 
-    # Clear output file
+    # Clear output file (write header with empty results)
     write_results(output_file, [], append=False, encrypt=False)
 
     total = len(people)
@@ -707,6 +702,8 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
         for p in people:
             person_id = f"{p['full_name'].split()[-1]}_{p['ssn']}"
             if person_id in checkpoint_set:
+                # Print skipped immediately
+                print(f"[{completed+1}/{total}] {p['full_name']:<20} SKIPPED (checkpoint)", GREY)
                 completed += 1
                 continue
             future = executor.submit(PBGCAgent(BASE_URL, config, rate_limiter, audit).process, p)
@@ -737,7 +734,8 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
                       f"Status: {result['account_status']:<10} "
                       f"({result['status']})", colour)
 
-                if len(results) % 5 == 0:
+                # Write in batches of 5
+                if len(results) % 5 == 0 and results:
                     write_results(output_file, results[-5:], append=True, encrypt=False)
 
             except Exception as e:
@@ -746,6 +744,7 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
                 log_dead_letter(dead_file, person, f"Exception: {e}")
                 completed += 1
 
+    # Write any remaining results
     if results:
         write_results(output_file, results, append=True, encrypt=False)
 
