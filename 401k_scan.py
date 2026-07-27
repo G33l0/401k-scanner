@@ -2,7 +2,7 @@
 """
 401k Scanner – Enterprise Red‑Team Edition
 Author: Red Team
-Version: 3.2
+Version: 3.3
 WARNING: Change BASE_URL below to your authorised sandbox target.
 """
 import sys
@@ -64,7 +64,7 @@ def print_banner():
     clear_screen()
     width = 60
     print(f"{CYAN}{'=' * width}{RESET}")
-    print(f"{CYAN}  401k SCANNER  v3.2 (Enterprise){RESET}".center(width))
+    print(f"{CYAN}  401k SCANNER  v3.3 (Enterprise){RESET}".center(width))
     print(f"{GREY}  Author: Red Team{RESET}".center(width))
     print(f"{GREY}  Target: {BASE_URL}{RESET}".center(width))
     print(f"{CYAN}{'=' * width}{RESET}\n")
@@ -84,7 +84,24 @@ DEFAULT_CONFIG = {
     "delay_max": 1.5,
     "timeout": 15,
     "retries": 3,
-    "success_indicators": ["benefit", "pension", "unclaimed", "retirement"],
+    "success_indicators": [
+        "your search has returned",
+        "benefit amount",
+        "unclaimed balance",
+        "pension benefit",
+        "you have a benefit",
+        "your account balance",
+        "missing participant"
+    ],
+    "negative_indicators": [
+        "no results",
+        "not found",
+        "does not match",
+        "no benefit",
+        "no unclaimed",
+        "try again",
+        "enter your last name"
+    ],
     "output_base": "results",
     "proxy": None,
     "user_agents": [
@@ -104,6 +121,7 @@ DEFAULT_CONFIG = {
     "checkpoint_file": "checkpoint.txt",
     "dead_letter_file": "dead_letter.txt",
     "audit_log_file": "audit.log",
+    "ssn_field": "ssn",            # field name used in the form
     "column_widths": {
         "full_name": 25,
         "ssn": 15,
@@ -145,8 +163,11 @@ class ConfigManager:
         print_status("\n--- Current Configuration ---", CYAN)
         config = ConfigManager.load()
         for key, val in config.items():
-            if key in ("user_agents", "custom_headers", "success_indicators", "captcha_api_key", "encryption_password", "column_widths"):
-                if key == "column_widths":
+            if key in ("user_agents", "custom_headers", "success_indicators", "negative_indicators", 
+                       "captcha_api_key", "encryption_password", "column_widths"):
+                if key in ("success_indicators", "negative_indicators"):
+                    print(f"  {key}: {', '.join(val)}")
+                elif key == "column_widths":
                     print(f"  column_widths: {val}")
                 else:
                     print(f"  {key}: <hidden or list>")
@@ -156,11 +177,14 @@ class ConfigManager:
         print_status("\nEnter new values (press Enter to keep current):", CYAN)
         new_config = {}
         for key, val in config.items():
-            if key == "user_agents":
-                print(f"Current user agents: {len(val)} agents.")
-                inp = colored_input("Enter new user agents (comma-separated, or leave blank): ")
+            if key in ("user_agents", "custom_headers", "success_indicators", "negative_indicators"):
+                if key in ("success_indicators", "negative_indicators"):
+                    prompt = f"{key} (comma-separated, current: {', '.join(val)}): "
+                else:
+                    prompt = f"{key} (comma-separated, or leave blank): "
+                inp = colored_input(prompt)
                 if inp:
-                    new_config[key] = [ua.strip() for ua in inp.split(',') if ua.strip()]
+                    new_config[key] = [kw.strip() for kw in inp.split(',') if kw.strip()]
                 else:
                     new_config[key] = val
             elif key == "custom_headers":
@@ -172,13 +196,6 @@ class ConfigManager:
                     except:
                         print_status("Invalid JSON, keeping current.", RED)
                         new_config[key] = val
-                else:
-                    new_config[key] = val
-            elif key == "success_indicators":
-                prompt = f"Success keywords (comma-separated, current: {', '.join(val)}): "
-                inp = colored_input(prompt)
-                if inp:
-                    new_config[key] = [kw.strip() for kw in inp.split(',') if kw.strip()]
                 else:
                     new_config[key] = val
             elif key in ("encryption_password", "captcha_api_key"):
@@ -339,6 +356,10 @@ class PBGCAgent:
         self.delay_min = config['delay_min']
         self.delay_max = config['delay_max']
         self.success_indicators = config['success_indicators']
+        self.negative_indicators = config.get('negative_indicators', [
+            "no results", "not found", "does not match", "no benefit", "no unclaimed", "try again"
+        ])
+        self.ssn_field = config.get('ssn_field', 'ssn')
         self.session = requests.Session()
         if config.get('proxy'):
             self.session.proxies = {'http': config['proxy'], 'https': config['proxy']}
@@ -385,10 +406,11 @@ class PBGCAgent:
             tokens['op'] = 'Search'
         return tokens
 
-    def _submit_search(self, last_name, ssn, tokens):
+    def _submit_search(self, last_name, ssn_last4, tokens):
+        """Submit with last name and last 4 digits of SSN."""
         data = {
             'last_name': last_name,
-            'ssn': ssn,
+            self.ssn_field: ssn_last4,
         }
         data.update(tokens)
         self.rate_limiter.wait()
@@ -406,17 +428,29 @@ class PBGCAgent:
             self.audit.log("SUBMIT_ERROR", f"Submission failed: {e}", last_name=last_name)
             return None
 
+    def _extract_ssn_last4(self, ssn):
+        """Extract last 4 digits from a full SSN (strip hyphens/spaces)."""
+        if not ssn:
+            return ""
+        clean = re.sub(r'[\s\-]', '', ssn)
+        return clean[-4:] if len(clean) >= 4 else clean
+
     def _parse_result(self, html):
         if not html:
             return False, "Unknown", "Unknown"
 
         soup = BeautifulSoup(html, 'html.parser')
         text = soup.get_text(separator=' ')
-
         lower = text.lower()
-        benefit = any(ind in lower for ind in self.success_indicators)
 
-        # Institution
+        # ---- POSITIVE INDICATORS (specific to PBGC success pages) ----
+        benefit = any(phrase in lower for phrase in self.success_indicators)
+
+        # ---- NEGATIVE INDICATORS (override false positives) ----
+        if any(phrase in lower for phrase in self.negative_indicators):
+            benefit = False
+
+        # ---- Institution Extraction ----
         inst = "Unknown"
         for tag in soup.find_all(['p', 'div', 'span', 'td', 'th']):
             txt = tag.get_text(strip=True)
@@ -439,7 +473,7 @@ class PBGCAgent:
                         if inst:
                             break
 
-        # Status
+        # ---- Status Extraction ----
         status = "Unknown"
         for tag in soup.find_all(['p', 'div', 'span', 'td', 'th']):
             txt = tag.get_text(strip=True)
@@ -454,16 +488,15 @@ class PBGCAgent:
                     status = word
                     break
 
-        if re.search(r'no (results?|records?|benefits?|pensions?)', lower):
-            benefit = False
-
         return benefit, inst, status
 
     def process(self, person):
         name_parts = person['full_name'].strip().split()
         last_name = name_parts[-1] if name_parts else 'Unknown'
-        ssn = person.get('ssn', '')
-        person_id = f"{last_name}_{ssn}"
+        full_ssn = person.get('ssn', '')
+        ssn_last4 = self._extract_ssn_last4(full_ssn)
+
+        person_id = f"{last_name}_{ssn_last4}"
 
         if person_id in checkpoint_set:
             return {**person, 'benefit_found': 'SKIPPED', 'institution': 'N/A',
@@ -480,7 +513,7 @@ class PBGCAgent:
         tokens = self._cached_tokens.copy()
         result_html = None
         for attempt in range(self.max_retries):
-            result_html = self._submit_search(last_name, ssn, tokens)
+            result_html = self._submit_search(last_name, ssn_last4, tokens)
             if result_html:
                 lower_resp = result_html.lower()
                 if 'please enter a valid' in lower_resp or 'invalid' in lower_resp:
@@ -570,7 +603,7 @@ def load_people(filepath, delimiter, field_order, password=None):
         print_status(f"Load error: {e}", RED)
         return None
 
-# ---------- Output Writing (Aligned) - FIXED ----------
+# ---------- Output Writing (Aligned) ----------
 def write_results(output_file, results, append=False, encrypt=False, password=None):
     fieldnames = ['full_name', 'ssn', 'dob', 'address', 'benefit_found', 'institution', 'account_status', 'status']
     # Clean institution: replace newlines with ' | '
@@ -641,7 +674,7 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
         mode = colored_input("Choose mode: [1] Single scan  [2] Batch scan from TXT: ")
         if mode == '1':
             name = colored_input("Full Name: ")
-            ssn = colored_input("SSN: ")
+            ssn = colored_input("SSN (full number, will use last 4): ")
             if not name or not ssn:
                 print_status("Aborted.", RED)
                 return
@@ -700,23 +733,32 @@ def run_scan(config, input_file=None, output_prefix=None, delimiter=None, field_
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_person = {}
         for p in people:
-            person_id = f"{p['full_name'].split()[-1]}_{p['ssn']}"
-            if person_id in checkpoint_set:
-                # Print skipped immediately
-                print(f"[{completed+1}/{total}] {p['full_name']:<20} SKIPPED (checkpoint)", GREY)
-                completed += 1
-                continue
+            # Use full ssn for checkpoint? We'll use last4 but we need to compute person_id later.
+            # We'll let process compute it.
             future = executor.submit(PBGCAgent(BASE_URL, config, rate_limiter, audit).process, p)
-            future_to_person[future] = (p, person_id)
+            future_to_person[future] = p
 
         for future in as_completed(future_to_person):
-            person, person_id = future_to_person[future]
+            person = future_to_person[future]
             try:
                 result = future.result()
                 if result['benefit_found'] in ('ERROR', 'SKIPPED'):
                     log_dead_letter(dead_file, result, result.get('status', 'Unknown'))
                 else:
                     results.append(result)
+                    # person_id is computed inside process, but we can recompute for checkpoint
+                    last_name = result['full_name'].split()[-1] if result['full_name'] else 'Unknown'
+                    ssn_last4 = agent._extract_ssn_last4(result['ssn']) if hasattr(agent, '_extract_ssn_last4') else result['ssn'][-4:]
+                    # Actually we already have it in the agent? We'll just save checkpoint with full name + ssn last4
+                    # For simplicity, we'll use the full name + ssn as unique id (but we need consistent)
+                    # We'll just save checkpoint using the same logic as inside process
+                    # To avoid duplication, we'll use the original person's data
+                    # Since we don't have person_id from process easily, we can recompute:
+                    name_parts = result['full_name'].strip().split()
+                    lname = name_parts[-1] if name_parts else 'Unknown'
+                    ssn_clean = re.sub(r'[\s\-]', '', result.get('ssn', ''))
+                    ssn_4 = ssn_clean[-4:] if len(ssn_clean) >= 4 else ssn_clean
+                    person_id = f"{lname}_{ssn_4}"
                     save_checkpoint(config['checkpoint_file'], person_id)
                 completed += 1
 
